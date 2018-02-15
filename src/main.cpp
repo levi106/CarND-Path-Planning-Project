@@ -8,16 +8,15 @@
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
+#include "spline.h"
+#include "path_planner.hpp"
+#include "utils.hpp"
+#include "input_params.hpp"
 
 using namespace std;
 
 // for convenience
 using json = nlohmann::json;
-
-// For converting back and forth between radians and degrees.
-constexpr double pi() { return M_PI; }
-double deg2rad(double x) { return x * pi() / 180; }
-double rad2deg(double x) { return x * 180 / pi(); }
 
 // Checks if the SocketIO event has JSON data.
 // If there is data the JSON object in string format will be returned,
@@ -34,10 +33,6 @@ string hasData(string s) {
   return "";
 }
 
-double distance(double x1, double y1, double x2, double y2)
-{
-	return sqrt((x2-x1)*(x2-x1)+(y2-y1)*(y2-y1));
-}
 int ClosestWaypoint(double x, double y, const vector<double> &maps_x, const vector<double> &maps_y)
 {
 
@@ -135,73 +130,13 @@ vector<double> getFrenet(double x, double y, double theta, const vector<double> 
 
 }
 
-// Transform from Frenet s,d coordinates to Cartesian x,y
-vector<double> getXY(double s, double d, const vector<double> &maps_s, const vector<double> &maps_x, const vector<double> &maps_y)
-{
-	int prev_wp = -1;
-
-	while(s > maps_s[prev_wp+1] && (prev_wp < (int)(maps_s.size()-1) ))
-	{
-		prev_wp++;
-	}
-
-	int wp2 = (prev_wp+1)%maps_x.size();
-
-	double heading = atan2((maps_y[wp2]-maps_y[prev_wp]),(maps_x[wp2]-maps_x[prev_wp]));
-	// the x,y,s along the segment
-	double seg_s = (s-maps_s[prev_wp]);
-
-	double seg_x = maps_x[prev_wp]+seg_s*cos(heading);
-	double seg_y = maps_y[prev_wp]+seg_s*sin(heading);
-
-	double perp_heading = heading-pi()/2;
-
-	double x = seg_x + d*cos(perp_heading);
-	double y = seg_y + d*sin(perp_heading);
-
-	return {x,y};
-
-}
-
 int main() {
+  string map_file = "../data/highway_map.csv";
   uWS::Hub h;
+  PathPlanner planner;
+  planner.LoadWaypointMap(map_file);
 
-  // Load up map values for waypoint's x,y,s and d normalized normal vectors
-  vector<double> map_waypoints_x;
-  vector<double> map_waypoints_y;
-  vector<double> map_waypoints_s;
-  vector<double> map_waypoints_dx;
-  vector<double> map_waypoints_dy;
-
-  // Waypoint map to read from
-  string map_file_ = "../data/highway_map.csv";
-  // The max s value before wrapping around the track back to 0
-  double max_s = 6945.554;
-
-  ifstream in_map_(map_file_.c_str(), ifstream::in);
-
-  string line;
-  while (getline(in_map_, line)) {
-  	istringstream iss(line);
-  	double x;
-  	double y;
-  	float s;
-  	float d_x;
-  	float d_y;
-  	iss >> x;
-  	iss >> y;
-  	iss >> s;
-  	iss >> d_x;
-  	iss >> d_y;
-  	map_waypoints_x.push_back(x);
-  	map_waypoints_y.push_back(y);
-  	map_waypoints_s.push_back(s);
-  	map_waypoints_dx.push_back(d_x);
-  	map_waypoints_dy.push_back(d_y);
-  }
-
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
-                     uWS::OpCode opCode) {
+  h.onMessage([&planner](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length, uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
     // The 2 signifies a websocket event
@@ -220,23 +155,45 @@ int main() {
           // j[1] is the data JSON object
           
         	// Main car's localization Data
-          	double car_x = j[1]["x"];
-          	double car_y = j[1]["y"];
-          	double car_s = j[1]["s"];
-          	double car_d = j[1]["d"];
-          	double car_yaw = j[1]["yaw"];
-          	double car_speed = j[1]["speed"];
+          InputParams params;
+          params.car_x = j[1]["x"];
+          params.car_y = j[1]["y"];
+          params.car_s = j[1]["s"];
+          params.car_d = j[1]["d"];
+          params.car_yaw = j[1]["yaw"];
+          params.car_speed = j[1]["speed"];
 
-          	// Previous path data given to the Planner
-          	auto previous_path_x = j[1]["previous_path_x"];
-          	auto previous_path_y = j[1]["previous_path_y"];
-          	// Previous path's end s and d values 
-          	double end_path_s = j[1]["end_path_s"];
-          	double end_path_d = j[1]["end_path_d"];
+          // Previous path data given to the Planner
+          int prev_size = j[1]["previous_path_x"].size();
+          for (int i = 0; i < prev_size; i++) {
+            params.previous_path_x.push_back(j[1]["previous_path_x"][i]);
+            params.previous_path_y.push_back(j[1]["previous_path_y"][i]);
+          }
+          // Previous path's end s and d values 
+          params.end_path_s = j[1]["end_path_s"];
+          params.end_path_d = j[1]["end_path_d"];
 
-          	// Sensor Fusion Data, a list of all other cars on the same side of the road.
-          	auto sensor_fusion = j[1]["sensor_fusion"];
+          // Sensor Fusion Data, a list of all other cars on the same side of the road.
+          auto sensor_fusion = j[1]["sensor_fusion"];
+          int fusion_size = sensor_fusion.size();
+          for (int i = 0; i < fusion_size; i++) {
+            SensorFusion fusion;
+            fusion.d = sensor_fusion[i][6];
+            fusion.vx = sensor_fusion[i][3];
+            fusion.vy = sensor_fusion[i][4];
+            fusion.v = distance(fusion.vx, fusion.vy, 0, 0);
+            fusion.s = sensor_fusion[i][5];
+            params.sensor_fusions.push_back(fusion);
+          }
 
+#if 1
+          vector<double> next_x_vals;
+          vector<double> next_y_vals;
+          planner.Fit(params);
+          planner.Predict(next_x_vals, next_y_vals);
+#endif
+
+#if 0
           	json msgJson;
 
           	vector<double> next_x_vals;
@@ -244,6 +201,25 @@ int main() {
 
 
           	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
+            double dist_inc = 0.5;
+//            int next_waypoint_index = NextWaypoint(car_x, car_y, car_yaw, map_waypoints_x, map_waypoints_y);
+
+            for (int i = 0; i < 50; i++) {
+              double next_s = car_s + (i+1) * dist_inc;
+              double next_d = 6;
+              vector<double> xy = getXY(next_s, next_d, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+              next_x_vals.push_back(xy[0]);
+              next_y_vals.push_back(xy[1]);
+//              int index = (next_waypoint_index + i) % map_waypoints_x.size();
+//              
+//              next_x_vals.push_back(map_waypoints_x[index]);
+//              next_y_vals.push_back(map_waypoints_y[index]);
+//              next_x_vals.push_back(car_x+(dist_inc*i)*cos(deg2rad(car_yaw)));
+//              next_y_vals.push_back(car_y+(dist_inc*i)*sin(deg2rad(car_yaw)));
+            }
+
+#endif
+          	json msgJson;
           	msgJson["next_x"] = next_x_vals;
           	msgJson["next_y"] = next_y_vals;
 
