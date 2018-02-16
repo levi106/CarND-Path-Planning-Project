@@ -1,5 +1,6 @@
 #include "vehicle.hpp"
 #include <iostream>
+#include <algorithm>
 #include <math.h>
 #include "cost.hpp"
 #include "constants.hpp"
